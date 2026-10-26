@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -47,20 +49,20 @@ func withNtfy(t *testing.T, url, topic, token string) {
 
 func TestSendNotification_Success(t *testing.T) {
 	var (
-		gotPath, gotBody, gotCT, gotTitle, gotPriority, gotTags, gotAuth string
+		gotPath string
+		gotReq  publishRequest
+		gotCT   string
+		gotAuth string
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		gotPath = r.URL.Path
-		gotBody = string(body)
 		gotCT = r.Header.Get("Content-Type")
-		gotTitle = r.Header.Get("Title")
-		gotPriority = r.Header.Get("Priority")
-		gotTags = r.Header.Get("Tags")
 		gotAuth = r.Header.Get("Authorization")
+		_ = json.Unmarshal(body, &gotReq)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"test"}`))
+		_, _ = w.Write([]byte(`{"id":"abc123"}`))
 	}))
 	defer srv.Close()
 
@@ -79,34 +81,48 @@ func TestSendNotification_Success(t *testing.T) {
 		t.Fatalf("unexpected tool error: %s", resultText(t, res))
 	}
 
-	if gotPath != "/alerts" {
-		t.Errorf("path = %q, want %q", gotPath, "/alerts")
+	if gotPath != "/" {
+		t.Errorf("path = %q, want %q", gotPath, "/")
 	}
-	if gotBody != "hello" {
-		t.Errorf("body = %q, want %q", gotBody, "hello")
-	}
-	if gotCT != "text/plain" {
-		t.Errorf("Content-Type = %q, want %q", gotCT, "text/plain")
-	}
-	if gotTitle != "greeting" {
-		t.Errorf("Title = %q, want %q", gotTitle, "greeting")
-	}
-	if gotPriority != "high" {
-		t.Errorf("Priority = %q, want %q", gotPriority, "high")
-	}
-	if gotTags != "wave,smile" {
-		t.Errorf("Tags = %q, want %q", gotTags, "wave,smile")
+	if gotCT != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", gotCT, "application/json")
 	}
 	if gotAuth != "Bearer tk_test" {
 		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer tk_test")
 	}
+	if gotReq.Topic != "alerts" {
+		t.Errorf("topic = %q, want %q", gotReq.Topic, "alerts")
+	}
+	if gotReq.Message != "hello" {
+		t.Errorf("message = %q, want %q", gotReq.Message, "hello")
+	}
+	if gotReq.Title != "greeting" {
+		t.Errorf("title = %q, want %q", gotReq.Title, "greeting")
+	}
+	if gotReq.Priority != "high" {
+		t.Errorf("priority = %q, want %q", gotReq.Priority, "high")
+	}
+	if len(gotReq.Tags) != 2 || gotReq.Tags[0] != "wave" || gotReq.Tags[1] != "smile" {
+		t.Errorf("tags = %v, want [wave smile]", gotReq.Tags)
+	}
+
+	// The response body should mention the returned message ID.
+	if txt := resultText(t, res); !strings.Contains(txt, "abc123") {
+		t.Errorf("result text = %q, want it to contain id=abc123", txt)
+	}
 }
 
 func TestSendNotification_TrailingSlashInURL(t *testing.T) {
-	var gotPath string
+	var (
+		gotPath string
+		gotReq  publishRequest
+	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
 		gotPath = r.URL.Path
+		_ = json.Unmarshal(body, &gotReq)
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
 	}))
 	defer srv.Close()
 
@@ -116,8 +132,17 @@ func TestSendNotification_TrailingSlashInURL(t *testing.T) {
 		newRequest(map[string]any{"message": "hi"})); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotPath != "/alerts" {
-		t.Errorf("path = %q, want %q", gotPath, "/alerts")
+
+	// With the JSON publish API, the topic travels in the body and the POST
+	// goes to the root of NTFY_URL — regardless of any trailing slash.
+	if gotPath != "/" {
+		t.Errorf("path = %q, want %q", gotPath, "/")
+	}
+	if gotReq.Topic != "alerts" {
+		t.Errorf("topic = %q, want %q", gotReq.Topic, "alerts")
+	}
+	if gotReq.Message != "hi" {
+		t.Errorf("message = %q, want %q", gotReq.Message, "hi")
 	}
 }
 
@@ -266,5 +291,90 @@ func TestSendNotification_BadURL(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Fatal("expected tool error for malformed URL")
+	}
+}
+
+func TestSendNotification_ExtendedFields(t *testing.T) {
+	var got publishRequest
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &got)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x"}`))
+	}))
+	defer srv.Close()
+
+	withNtfy(t, srv.URL, "alerts", "")
+
+	_, err := sendNotificationHandler(context.Background(), newRequest(map[string]any{
+		"message":     "hi",
+		"click":       "https://example.com",
+		"icon":        "https://example.com/icon.png",
+		"markdown":    true,
+		"delay":       "30m",
+		"attach":      "https://example.com/file.pdf",
+		"filename":    "report.pdf",
+		"email":       "ops@example.com",
+		"call":        "+15551234567",
+		"cache":       false,
+		"firebase":    false,
+		"actions":     `[{"action":"view","label":"Open","url":"https://example.com"}]`,
+		"sequence_id": "seq-1",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got.Click != "https://example.com" {
+		t.Errorf("click = %q", got.Click)
+	}
+	if got.Icon != "https://example.com/icon.png" {
+		t.Errorf("icon = %q", got.Icon)
+	}
+	if !got.Markdown {
+		t.Error("markdown = false, want true")
+	}
+	if got.Delay != "30m" {
+		t.Errorf("delay = %q", got.Delay)
+	}
+	if got.Attach != "https://example.com/file.pdf" {
+		t.Errorf("attach = %q", got.Attach)
+	}
+	if got.Filename != "report.pdf" {
+		t.Errorf("filename = %q", got.Filename)
+	}
+	if got.Email != "ops@example.com" {
+		t.Errorf("email = %q", got.Email)
+	}
+	if got.Call != "+15551234567" {
+		t.Errorf("call = %q", got.Call)
+	}
+	if got.Cache == nil || *got.Cache != false {
+		t.Errorf("cache = %v, want pointer to false", got.Cache)
+	}
+	if got.Firebase == nil || *got.Firebase != false {
+		t.Errorf("firebase = %v, want pointer to false", got.Firebase)
+	}
+	if string(got.Actions) != `[{"action":"view","label":"Open","url":"https://example.com"}]` {
+		t.Errorf("actions = %s", string(got.Actions))
+	}
+	if got.SequenceID != "seq-1" {
+		t.Errorf("sequence_id = %q", got.SequenceID)
+	}
+}
+
+func TestSendNotification_InvalidActionsJSON(t *testing.T) {
+	withNtfy(t, "http://127.0.0.1:1", "alerts", "")
+
+	res, err := sendNotificationHandler(context.Background(), newRequest(map[string]any{
+		"message": "hi",
+		"actions": `not-json`,
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.IsError {
+		t.Fatal("expected tool error for invalid actions JSON")
 	}
 }

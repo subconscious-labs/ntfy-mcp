@@ -11,6 +11,7 @@ Transport is `stdio`. All configuration comes from environment variables.
 
 - One tool: `send_notification`.
 - Optional `title`, `priority`, and `tags` arguments.
+- Full pass-through of the ntfy JSON publish API: `click`, `icon`, `markdown`, `delay`, `attach`, `filename`, `email`, `call`, `cache`, `firebase`, `actions`, and `sequence_id`.
 - Optional Bearer-token authentication via `NTFY_TOKEN`.
 - Version is injected at build time through `-ldflags -X main.version`.
 - No dependencies other than `github.com/mark3labs/mcp-go` and the Go stdlib.
@@ -67,23 +68,39 @@ Example entry for `mcp.json` / `claude_desktop_config.json`:
 
 ## Tool `send_notification`
 
-| Argument   | Type   | Required | Description                                                       |
-|------------|--------|:--------:|-------------------------------------------------------------------|
-| `message`  | string | yes      | Notification body (sent as the POST request body).                |
-| `title`    | string | no       | Notification title (`Title` HTTP header).                         |
-| `priority` | string | no       | `min`, `low`, `default`, `high`, `urgent` (`Priority` header).    |
-| `tags`     | string | no       | Comma-separated tags, e.g. `warning,skull` (`Tags` header).       |
+| Argument      | Type    | Required | Description                                                        |
+|---------------|---------|:--------:|--------------------------------------------------------------------|
+| `message`     | string  | yes      | Notification body.                                                 |
+| `title`       | string  | no       | Notification title.                                                |
+| `priority`    | string  | no       | `min`, `low`, `default`, `high`, `urgent`.                         |
+| `tags`        | string  | no       | Comma-separated tags, e.g. `warning,skull`.                        |
+| `click`       | string  | no       | URL opened when the notification is tapped.                        |
+| `icon`        | string  | no       | URL of a notification icon.                                        |
+| `markdown`    | boolean | no       | Render the message body as Markdown.                               |
+| `delay`       | string  | no       | Delivery delay, e.g. `30m` or `1h`.                                |
+| `attach`      | string  | no       | URL of a file to attach (URL only — no upload).                    |
+| `filename`    | string  | no       | Filename for the attachment.                                       |
+| `email`       | string  | no       | Forward the notification to this email address.                    |
+| `call`        | string  | no       | Call this phone number with the notification.                      |
+| `cache`       | boolean | no       | Set `false` to keep the message out of the server cache.           |
+| `firebase`    | boolean | no       | Set `false` to skip forwarding via Firebase.                       |
+| `actions`     | string  | no       | JSON array of action buttons (`view`, `broadcast`, `http`, `copy`).|
+| `sequence_id` | string  | no       | Update an existing notification with this sequence ID.             |
+
+Publishing uses the ntfy **JSON publish API**: the tool POSTs a JSON body to
+`NTFY_URL` and the topic is carried inside the body. This makes the flat set of
+optional arguments above possible without inventing a second tool.
 
 Example call from the LLM side:
 
 > Call `send_notification` with:
-> `message="Backup finished"`, `title="Backup"`,
-> `priority="high"`, `tags="white_check_mark"`.
+> `message="Backup finished"`, `title="Backup"`, `priority="high"`,
+> `tags="white_check_mark"`, `click="https://ci.example.com/run/42"`.
 
-Successful result:
+Successful result (the `id` can later be passed back as `sequence_id`):
 
 ```
-Notification sent (HTTP 200)
+Notification sent (HTTP 200, id=abc123)
 ```
 
 On failure (invalid arguments, network error, non-2xx response from ntfy),
@@ -108,6 +125,10 @@ printf '%s\n' \
   | NTFY_TOPIC=alerts ./bin/ntfy-mcp
 ```
 
+Since **1.1.0** the tool publishes via the ntfy JSON API and accepts the
+optional publish fields listed above. The contract is backwards-compatible
+with 1.0.0: the only required argument is still `message`.
+
 ## Testing
 
 ```bash
@@ -128,10 +149,16 @@ run entirely in-process. Cases covered:
 - `loadConfig`: required `NTFY_TOPIC`, default `NTFY_URL`, overrides;
 - `run`: config-error path returns before `ServeStdio`;
 - `newServer`: constructor does not panic and returns a non-nil server;
-- `version`: defaults to a non-empty string.
+- `version`: defaults to a non-empty string;
+- extended publish fields (`click`, `icon`, `markdown`, `delay`, `attach`,
+  `filename`, `email`, `call`, `cache=false`, `firebase=false`, `actions`,
+  `sequence_id`) end up in the JSON body;
+- malformed `actions` JSON is rejected before any network call;
+- trailing-slash normalisation on `NTFY_URL` (path stays `/`, topic travels
+  in the body).
 
-Current coverage is around **88%** of statements, with `loadConfig` and
-`newServer` at 100% and `sendNotificationHandler` at ~96%.
+Current coverage is around **93%** of statements, with `loadConfig` and
+`newServer` at 100% and `sendNotificationHandler` at ~98%.
 
 `main` and the stdio-serving branch of `run` are intentionally not unit-tested:
 they require an actual process boundary (`os.Exit`, `os.Stdin`). If you ever need
@@ -144,8 +171,10 @@ tagged `//go:build integration` that shells out to the built binary.
 - `http.DefaultClient` is used without a per-request timeout. That is fine for
   local MCP sessions, but consider adding `context.WithTimeout` in the handler
   if your network is unreliable.
-- ntfy features such as attachments, actions, and templates are intentionally
-  not supported — the server is meant to stay minimal.
+- Attachments are supported by URL only (`attach` + `filename`). Uploading
+  files would require multipart handling and temporary storage, which breaks
+  the stateless proxy design.
+- Templates and multi-topic publishing are intentionally not supported.
 
 ## License
 

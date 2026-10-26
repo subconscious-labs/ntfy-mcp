@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +18,6 @@ import (
 // version is overridden at build time via:
 //
 //	go build -ldflags "-X main.version=$(VERSION)" .
-//
-// Default value is used when building without ldflags (e.g. `go run .`, `go test`).
 var version = "dev"
 
 var (
@@ -26,9 +26,8 @@ var (
 	ntfyToken string
 )
 
-// loadConfig reads configuration from environment variables and applies
-// defaults. It is the single source of truth: on every call it resets all
-// global settings, so it is safe to call multiple times (e.g. from tests).
+// loadConfig reads configuration from environment variables and applies defaults.
+// It is the single source of truth and is safe to call multiple times.
 func loadConfig() error {
 	ntfyURL = "https://ntfy.sh"
 	if v := os.Getenv("NTFY_URL"); v != "" {
@@ -42,8 +41,30 @@ func loadConfig() error {
 	return nil
 }
 
-// newServer builds an MCP server with a single tool, send_notification,
-// that POSTs a notification to the configured ntfy topic.
+// publishRequest mirrors the ntfy JSON publish API. All fields except Message
+// are optional. Cache and Firebase use pointers so that an explicit `false`
+// can be distinguished from "not set".
+type publishRequest struct {
+	Topic      string          `json:"topic"`
+	Message    string          `json:"message"`
+	Title      string          `json:"title,omitempty"`
+	Priority   string          `json:"priority,omitempty"`
+	Tags       []string        `json:"tags,omitempty"`
+	Click      string          `json:"click,omitempty"`
+	Icon       string          `json:"icon,omitempty"`
+	Markdown   bool            `json:"markdown,omitempty"`
+	Delay      string          `json:"delay,omitempty"`
+	Attach     string          `json:"attach,omitempty"`
+	Filename   string          `json:"filename,omitempty"`
+	Email      string          `json:"email,omitempty"`
+	Call       string          `json:"call,omitempty"`
+	Cache      *bool           `json:"cache,omitempty"`
+	Firebase   *bool           `json:"firebase,omitempty"`
+	Actions    json.RawMessage `json:"actions,omitempty"`
+	SequenceID string          `json:"sequence_id,omitempty"`
+}
+
+// newServer builds an MCP server with a single tool, send_notification.
 func newServer() *server.MCPServer {
 	s := server.NewMCPServer(
 		"ntfy-mcp",
@@ -52,11 +73,23 @@ func newServer() *server.MCPServer {
 	)
 
 	tool := mcp.NewTool("send_notification",
-		mcp.WithDescription("Send a push notification via ntfy"),
+		mcp.WithDescription("Send or update a push notification via ntfy"),
 		mcp.WithString("message", mcp.Required(), mcp.Description("Notification body text")),
 		mcp.WithString("title", mcp.Description("Optional notification title")),
 		mcp.WithString("priority", mcp.Description("Optional priority: min, low, default, high, urgent")),
 		mcp.WithString("tags", mcp.Description("Optional comma-separated tags (e.g. warning,skull)")),
+		mcp.WithString("click", mcp.Description("Optional URL opened when the notification is tapped")),
+		mcp.WithString("icon", mcp.Description("Optional URL of a notification icon")),
+		mcp.WithBoolean("markdown", mcp.Description("Render the message body as Markdown")),
+		mcp.WithString("delay", mcp.Description("Optional delivery delay (e.g. 30m, 1h)")),
+		mcp.WithString("attach", mcp.Description("Optional URL of a file to attach")),
+		mcp.WithString("filename", mcp.Description("Optional filename for the attachment")),
+		mcp.WithString("email", mcp.Description("Optional email address to forward the notification to")),
+		mcp.WithString("call", mcp.Description("Optional phone number to call with the notification")),
+		mcp.WithBoolean("cache", mcp.Description("Set to false to keep the message out of the server cache")),
+		mcp.WithBoolean("firebase", mcp.Description("Set to false to skip forwarding via Firebase")),
+		mcp.WithString("actions", mcp.Description("Optional JSON array of action buttons")),
+		mcp.WithString("sequence_id", mcp.Description("Optional sequence ID to update an existing notification")),
 	)
 
 	s.AddTool(tool, sendNotificationHandler)
@@ -64,7 +97,6 @@ func newServer() *server.MCPServer {
 }
 
 // run loads configuration and serves the MCP protocol over stdio.
-// Kept separate from main so that main stays free of logic and run is testable.
 func run() error {
 	if err := loadConfig(); err != nil {
 		return err
@@ -79,9 +111,8 @@ func main() {
 	}
 }
 
-// sendNotificationHandler handles the send_notification tool call: it builds
-// an HTTP POST request to ntfy with the message as body and optional Title,
-// Priority, Tags, and Authorization headers, then checks the response status.
+// sendNotificationHandler builds a JSON publish request from the tool arguments,
+// POSTs it to ntfy, and reports the resulting message ID on success.
 func sendNotificationHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := request.GetArguments()
 
@@ -90,22 +121,69 @@ func sendNotificationHandler(ctx context.Context, request mcp.CallToolRequest) (
 		return mcp.NewToolResultError("message is required and must be a non-empty string"), nil
 	}
 
-	url := fmt.Sprintf("%s/%s", strings.TrimRight(ntfyURL, "/"), ntfyTopic)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(message))
+	pr := publishRequest{
+		Topic:   ntfyTopic,
+		Message: message,
+	}
+
+	if v, _ := args["title"].(string); v != "" {
+		pr.Title = v
+	}
+	if v, _ := args["priority"].(string); v != "" {
+		pr.Priority = v
+	}
+	if v, _ := args["tags"].(string); v != "" {
+		pr.Tags = strings.Split(v, ",")
+	}
+	if v, _ := args["click"].(string); v != "" {
+		pr.Click = v
+	}
+	if v, _ := args["icon"].(string); v != "" {
+		pr.Icon = v
+	}
+	if v, _ := args["markdown"].(bool); v {
+		pr.Markdown = true
+	}
+	if v, _ := args["delay"].(string); v != "" {
+		pr.Delay = v
+	}
+	if v, _ := args["attach"].(string); v != "" {
+		pr.Attach = v
+	}
+	if v, _ := args["filename"].(string); v != "" {
+		pr.Filename = v
+	}
+	if v, _ := args["email"].(string); v != "" {
+		pr.Email = v
+	}
+	if v, _ := args["call"].(string); v != "" {
+		pr.Call = v
+	}
+	if v, ok := args["cache"].(bool); ok {
+		pr.Cache = &v
+	}
+	if v, ok := args["firebase"].(bool); ok {
+		pr.Firebase = &v
+	}
+	if v, _ := args["actions"].(string); v != "" {
+		pr.Actions = json.RawMessage(v)
+	}
+	if v, _ := args["sequence_id"].(string); v != "" {
+		pr.SequenceID = v
+	}
+
+	body, err := json.Marshal(pr)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal request: %v", err)), nil
+	}
+
+	url := strings.TrimRight(ntfyURL, "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to create request: %v", err)), nil
 	}
 
-	req.Header.Set("Content-Type", "text/plain")
-	if title, _ := args["title"].(string); title != "" {
-		req.Header.Set("Title", title)
-	}
-	if priority, _ := args["priority"].(string); priority != "" {
-		req.Header.Set("Priority", priority)
-	}
-	if tags, _ := args["tags"].(string); tags != "" {
-		req.Header.Set("Tags", tags)
-	}
+	req.Header.Set("Content-Type", "application/json")
 	if ntfyToken != "" {
 		req.Header.Set("Authorization", "Bearer "+ntfyToken)
 	}
@@ -116,9 +194,18 @@ func sendNotificationHandler(ctx context.Context, request mcp.CallToolRequest) (
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return mcp.NewToolResultError(fmt.Sprintf("ntfy returned %d: %s", resp.StatusCode, string(body))), nil
+		return mcp.NewToolResultError(fmt.Sprintf("ntfy returned %d: %s", resp.StatusCode, string(respBody))), nil
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(respBody, &result)
+
+	if result.ID != "" {
+		return mcp.NewToolResultText(fmt.Sprintf("Notification sent (HTTP %d, id=%s)", resp.StatusCode, result.ID)), nil
 	}
 	return mcp.NewToolResultText(fmt.Sprintf("Notification sent (HTTP %d)", resp.StatusCode)), nil
 }
